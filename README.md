@@ -30,7 +30,6 @@ python call_contract.py
 FORDEFI_API_TOKEN=<bearer token from Fordefi console>
 FORDEFI_PRIVATE_KEY_PATH=./private.pem
 FORDEFI_VAULT_ID=<uuid of your Stacks vault>
-STACKS_NETWORK=mainnet
 STACKS_VAULT_ADDRESS=SP...
 ```
 
@@ -55,8 +54,8 @@ ARGS = [
 Stacks transactions follow the **SIP-005** binary wire format. There is no compilation step — you construct the bytes directly. The structure for a contract call is:
 
 ```
-[version: 1]              0x00 = mainnet, 0x80 = testnet
-[chain_id: 4]             0x00000001 = mainnet
+[version: 1]              0x00 = mainnet
+[chain_id: 4]             0x00000001
 [auth_type: 1]            0x04 = standard single-sig
 [hash_mode: 1]            0x00 = P2PKH
 [signer hash160: 20]      decoded from the sender's Stacks address
@@ -79,7 +78,7 @@ Stacks transactions follow the **SIP-005** binary wire format. There is no compi
 
 ### Address Decoding (C32Check)
 
-Stacks addresses use a base-32 encoding called C32Check. To get the raw `hash160` bytes needed in the transaction, the address characters after the 2-char prefix (`SP`, `ST`, etc.) are decoded using the alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, producing 25 bytes: `version(1) + hash160(20) + checksum(4)`. Only the 20 hash160 bytes are used in the transaction body.
+Stacks addresses use a base-32 encoding called C32Check. To get the raw `hash160` bytes needed in the transaction, the address characters after the `SP` prefix are decoded using the alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, producing 25 bytes: `version(1) + hash160(20) + checksum(4)`. Only the 20 hash160 bytes are used in the transaction body.
 
 ```python
 _C32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -224,7 +223,7 @@ Signature is base64-encoded DER, sent as `x-signature`. Timestamp (ms) sent as `
     "type": "stacks_transaction",
     "details": {
         "type": "stacks_serialized_transaction",
-        "chain": "stacks_mainnet",          # or stacks_testnet
+        "chain": "stacks_mainnet",
         "serialized_transaction": "0x...",  # your unsigned tx hex
         "push_mode": "auto",
         "fail_on_prediction_failure": False,
@@ -238,15 +237,15 @@ Fordefi fills in the 65-byte signature field and broadcasts the completed transa
 
 ## Stacks Network Reference
 
-| | Mainnet | Testnet |
-|---|---|---|
-| Fordefi chain | `stacks_mainnet` | `stacks_testnet` |
-| Address prefix | `SP` | `ST` |
-| Version byte | `0x16` (22) | `0x1a` (26) |
-| Chain ID | `0x00000001` | `0x80000000` |
-| TX version | `0x00` | `0x80` |
-| Hiro API | `https://api.mainnet.hiro.so` | `https://api.testnet.hiro.so` |
-| Explorer | `https://explorer.hiro.so` | `https://explorer.hiro.so/?chain=testnet` |
+| | Value |
+|---|---|
+| Fordefi chain | `stacks_mainnet` |
+| Address prefix | `SP` |
+| Version byte | `0x16` (22) |
+| Chain ID | `0x00000001` |
+| TX version | `0x00` |
+| Hiro API | `https://api.mainnet.hiro.so` |
+| Explorer | `https://explorer.hiro.so` |
 
 ---
 
