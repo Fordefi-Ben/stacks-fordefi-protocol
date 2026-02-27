@@ -203,14 +203,15 @@ def get_nonce(address: str) -> int:
     return int(resp.json()["nonce"])
 
 
-def estimate_fee(payload_hex: str, estimated_len: int) -> int:
+def _estimate_fee_hiro(payload_hex: str, estimated_len: int) -> int:
+    """Fallback: estimate fee via Hiro's fee endpoint (payload-only, no full tx needed)."""
     resp = requests.post(
         f"{HIRO_API}/v2/fees/transaction",
         json={"transaction_payload": payload_hex, "estimated_len": estimated_len},
         timeout=15,
     )
     if not resp.ok:
-        print(f"  Fee estimation failed ({resp.status_code}), using fallback 2000 µSTX")
+        print(f"  Hiro fee estimation failed ({resp.status_code}), using fallback 2000 µSTX")
         return 2000
     estimations = resp.json().get("estimations", [])
     fee = estimations[1]["fee"] if len(estimations) > 1 else estimations[0]["fee"]
@@ -223,7 +224,7 @@ def _serialize_call_payload_only(
     function_name: str,
     args: list[bytes],
 ) -> str:
-    """Payload-only hex for fee estimation."""
+    """Payload-only hex for Hiro fee estimation."""
     contract_ver, contract_hash = _decode_stacks_address(contract_address)
     p = bytearray()
     p += b"\x02"
@@ -235,6 +236,61 @@ def _serialize_call_payload_only(
     for arg in args:
         p += arg
     return p.hex()
+
+
+def estimate_fee(nonce: int, private_key) -> int:
+    """
+    Primary: call Fordefi's predict endpoint with a zero-fee draft transaction.
+    The fee field doesn't affect simulation logic — only miner selection — so
+    fee=0 gives a valid prediction. We extract the estimated fee from the
+    response and rebuild the real transaction with it.
+    Fallback: Hiro fee estimation API.
+    """
+    draft_tx = serialize_contract_call(
+        sender_address=VAULT_ADDRESS,
+        nonce=nonce,
+        fee=0,
+        contract_address=CONTRACT_ADDRESS,
+        contract_name=CONTRACT_NAME,
+        function_name=FUNCTION_NAME,
+        args=ARGS,
+    )
+    predict_payload = {
+        "vault_id": VAULT_ID,
+        "signer_type": "api_signer",
+        "type": "stacks_transaction",
+        "details": {
+            "type": "stacks_serialized_transaction",
+            "chain": FORDEFI_CHAIN,
+            "serialized_transaction": "0x" + draft_tx.hex(),
+            "push_mode": "auto",
+            "fail_on_prediction_failure": False,
+        },
+    }
+    path = "/api/v1/transactions/predict"
+    body = json.dumps(predict_payload, separators=(",", ":"))
+    headers = _sign_fordefi_request(private_key, path, body)
+    try:
+        resp = requests.post(f"https://api.fordefi.com{path}", data=body, headers=headers, timeout=20)
+        if resp.ok:
+            data = resp.json()
+            # Fee lives at details.fee.value (µSTX as string or int)
+            fee_val = (
+                data.get("details", {}).get("fee", {}).get("value")
+                or data.get("fee", {}).get("value")
+            )
+            if fee_val is not None:
+                print("  Fee source: Fordefi predict")
+                return max(int(fee_val), 200)
+        print(f"  Fordefi predict returned {resp.status_code}, falling back to Hiro")
+    except Exception as e:
+        print(f"  Fordefi predict error ({e}), falling back to Hiro")
+
+    # Hiro fallback
+    payload_hex = _serialize_call_payload_only(CONTRACT_ADDRESS, CONTRACT_NAME, FUNCTION_NAME, ARGS)
+    estimated_len = 5 + 108 + 6 + len(bytes.fromhex(payload_hex))
+    print("  Fee source: Hiro")
+    return _estimate_fee_hiro(payload_hex, estimated_len)
 
 
 # ---------------------------------------------------------------------------
@@ -260,19 +316,19 @@ def _sign_fordefi_request(private_key, path: str, body: str) -> dict:
 def main():
     print(f"Calling {CONTRACT_ADDRESS}.{CONTRACT_NAME}::{FUNCTION_NAME}")
 
+    private_key = serialization.load_pem_private_key(
+        Path(PRIVATE_KEY_PATH).read_bytes(), password=None
+    )
+
     # 1. Nonce
     nonce = get_nonce(VAULT_ADDRESS)
     print(f"  Nonce: {nonce}")
 
-    # 2. Fee estimate
-    payload_hex = _serialize_call_payload_only(
-        CONTRACT_ADDRESS, CONTRACT_NAME, FUNCTION_NAME, ARGS
-    )
-    estimated_len = 5 + 108 + 6 + len(bytes.fromhex(payload_hex))
-    fee = estimate_fee(payload_hex, estimated_len)
+    # 2. Fee — tries Fordefi predict first, falls back to Hiro
+    fee = estimate_fee(nonce, private_key)
     print(f"  Fee: {fee} µSTX")
 
-    # 3. Serialize unsigned tx
+    # 3. Serialize final unsigned tx with real fee
     raw_tx = serialize_contract_call(
         sender_address=VAULT_ADDRESS,
         nonce=nonce,
@@ -281,7 +337,6 @@ def main():
         contract_name=CONTRACT_NAME,
         function_name=FUNCTION_NAME,
         args=ARGS,
-        network=NETWORK,
     )
     serialized_hex = "0x" + raw_tx.hex()
     print(f"  Serialized tx: {len(raw_tx)} bytes")
@@ -304,9 +359,6 @@ def main():
     # 5. Sign and submit
     path = "/api/v1/transactions"
     body = json.dumps(payload, separators=(",", ":"))
-    private_key = serialization.load_pem_private_key(
-        Path(PRIVATE_KEY_PATH).read_bytes(), password=None
-    )
     headers = _sign_fordefi_request(private_key, path, body)
 
     print("Submitting to Fordefi...")
