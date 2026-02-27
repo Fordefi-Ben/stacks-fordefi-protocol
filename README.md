@@ -1,6 +1,6 @@
 # Stacks Smart Contract Calls via Fordefi
 
-Call Clarity smart contracts on Stacks using the Fordefi MPC API — no SDK, pure Python. Transactions are serialized by hand using the SIP-005 wire format and submitted to Fordefi as raw bytes for signing and broadcast.
+Serialize and submit Clarity contract calls to Stacks mainnet via the Fordefi API. Transactions follow the SIP-005 binary wire format; Fordefi's MPC infrastructure signs and broadcasts them.
 
 ---
 
@@ -11,7 +11,7 @@ call_contract.py  →  Fordefi API  →  Stacks Mainnet
   (serialize tx)     (MPC signer)    (broadcast)
 ```
 
-Fordefi acts as the signing layer. Your script builds the unsigned transaction, Fordefi's MPC infrastructure signs it and broadcasts it. The key constraint: Fordefi's Stacks integration only accepts `stacks_serialized_transaction` — meaning you provide the full binary transaction and Fordefi fills in the 65-byte signature before broadcast.
+Fordefi's Stacks integration accepts only `stacks_serialized_transaction`. You build the full unsigned transaction binary; Fordefi fills in the 65-byte signature and broadcasts.
 
 ---
 
@@ -33,7 +33,7 @@ FORDEFI_VAULT_ID=<uuid of your Stacks vault>
 STACKS_VAULT_ADDRESS=SP...
 ```
 
-To target a different contract, edit the config block near the top of `call_contract.py`:
+To target a different contract, edit the config block in `call_contract.py`:
 
 ```python
 CONTRACT_ADDRESS = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7"
@@ -49,9 +49,9 @@ ARGS = [
 
 ---
 
-## How Transaction Serialization Works
+## Transaction Serialization
 
-Stacks transactions follow the **SIP-005** binary wire format. There is no compilation step — you construct the bytes directly. The structure for a contract call is:
+Stacks transactions use the SIP-005 binary wire format. You construct the bytes directly. Structure for a contract call:
 
 ```
 [version: 1]              0x00 = mainnet
@@ -60,9 +60,9 @@ Stacks transactions follow the **SIP-005** binary wire format. There is no compi
 [hash_mode: 1]            0x00 = P2PKH
 [signer hash160: 20]      decoded from the sender's Stacks address
 [nonce: 8]                big-endian u64, fetched from Hiro API
-[fee: 8]                  big-endian u64, estimated via Hiro API
+[fee: 8]                  big-endian u64, estimated via Fordefi predict
 [key_encoding: 1]         0x00 = compressed public key
-[signature: 65]           zeroed out — Fordefi fills this in
+[signature: 65]           zeroed out; Fordefi fills this in
 [anchor_mode: 1]          0x03 = any
 [post_condition_mode: 1]  0x01 = allow, 0x02 = deny
 [post_conditions_count: 4]
@@ -78,7 +78,7 @@ Stacks transactions follow the **SIP-005** binary wire format. There is no compi
 
 ### Address Decoding (C32Check)
 
-Stacks addresses use a base-32 encoding called C32Check. To get the raw `hash160` bytes needed in the transaction, the address characters after the `SP` prefix are decoded using the alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, producing 25 bytes: `version(1) + hash160(20) + checksum(4)`. Only the 20 hash160 bytes are used in the transaction body.
+Stacks addresses are C32Check encoded. Decoding produces 25 bytes: `version(1) + hash160(20) + checksum(4)`. Only the 20 hash160 bytes go into the transaction.
 
 ```python
 _C32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -93,7 +93,7 @@ def _decode_stacks_address(address: str) -> tuple[int, bytes]:
 
 ### Clarity Value Serialization
 
-Every function argument is serialized as a **Clarity value** — a type tag byte followed by the data. The full set of helpers in `call_contract.py`:
+Each function argument is a Clarity value: a type tag byte followed by the encoded data.
 
 | Helper | Tag | Encoding |
 |---|---|---|
@@ -105,7 +105,7 @@ Every function argument is serialized as a **Clarity value** — a type tag byte
 | `clarity_buffer(data)` | `0x02` | 4-byte len + raw bytes |
 | `clarity_principal(addr)` | `0x05` | version(1) + hash160(20) |
 | `clarity_contract_principal(addr, name)` | `0x06` | version(1) + hash160(20) + 1-byte len + name |
-| `b"\x09"` (inline) | `0x09` | Clarity `none` — no body |
+| `b"\x09"` (inline) | `0x09` | Clarity `none`, no body |
 
 Example: encoding `(supply-collateral-add wstx u1000000 u0 none)`:
 
@@ -122,7 +122,7 @@ ARGS = [
 
 ## Post-Conditions
 
-Post-conditions let you declare — at the transaction level — exactly which asset movements are permitted. The Stacks node enforces these before committing the transaction. If the actual execution moves an asset not covered by a post-condition, the tx is rolled back (fees are still charged).
+Post-conditions declare which asset movements a transaction is permitted to make. The Stacks node enforces them before committing; if execution moves an asset not covered, the tx is rolled back (fees still charged).
 
 ### Modes
 
@@ -131,23 +131,20 @@ Post-conditions let you declare — at the transaction level — exactly which a
 | **Allow** | `0x01` | Any asset movement is permitted |
 | **Deny** | `0x02` | Only explicitly listed movements are permitted; anything else causes a rollback |
 
-`call_contract.py` uses **allow mode** (`0x01`). This was necessary because the Zest Protocol `supply-collateral-add` function mints `v0-vault-stx::zft` receipt tokens back to the caller — an asset movement we didn't list. In deny mode that caused an on-chain rollback, as we observed during testing.
+`call_contract.py` uses allow mode (`0x01`). The Zest Protocol `supply-collateral-add` function mints `v0-vault-stx::zft` receipt tokens back to the caller; in deny mode that unlisted movement caused an on-chain rollback.
 
-### Why Deny Mode is Better for Production
+### Deny Mode for Production
 
-Allow mode is fine for testing, but it removes a critical safeguard. In deny mode you make an explicit, verifiable commitment about what the transaction is allowed to do. Risks deny mode guards against:
+Allow mode removes a critical safeguard. With deny mode you make an explicit commitment about what the transaction is permitted to do:
 
-**Malicious contract upgrades.** A contract you trusted at integration time might later be upgraded to drain additional tokens. Deny mode means those unexpected transfers never succeed.
-
-**Unintended cross-contract side-effects.** Clarity prevents classic re-entrancy, but inter-contract calls can trigger asset movements you didn't intend. Deny mode catches these at the protocol level.
-
-**Misconfigured arguments.** If you pass the wrong amount, deny mode acts as a final sanity check — the transaction won't clear unless the actual on-chain result matches your declared intent.
-
-**Auditability.** A transaction with explicit post-conditions is self-documenting. Anyone can read the raw bytes and know exactly what asset movements the submitter authorised.
+- **Contract upgrades.** A contract upgraded after integration can drain additional tokens. Deny mode ensures unexpected transfers fail.
+- **Cross-contract side-effects.** Clarity prevents re-entrancy, but inter-contract calls can trigger asset movements you didn't intend. Deny mode catches these at the protocol level.
+- **Argument errors.** If you pass the wrong amount, the transaction fails on-chain before it can do damage.
+- **Auditability.** Anyone reading the raw transaction can verify exactly which asset movements were authorized.
 
 ### Post-Condition Wire Format
 
-For a **fungible token** post-condition:
+Fungible token post-condition:
 
 ```
 [type: 1]                 0x01 = fungible token
@@ -161,7 +158,7 @@ For a **fungible token** post-condition:
 [amount: 8]               big-endian u64
 ```
 
-For an **STX** post-condition (type `0x00`), the asset info fields are omitted — principal is followed directly by condition code and amount.
+STX post-condition (type `0x00`): omit asset info fields; principal is followed directly by condition code and amount.
 
 ### Example: Deny Mode with FT Post-Condition
 
@@ -183,7 +180,7 @@ post_conds = post_condition_ft(
     asset_contract     = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7",
     asset_contract_name= "v0-vault-stx",
     asset_name         = "zft",
-    code               = 0x03,              # gte — receive at least some
+    code               = 0x03,              # gte
     amount             = 0,
 )
 
@@ -224,14 +221,14 @@ Signature is base64-encoded DER, sent as `x-signature`. Timestamp (ms) sent as `
     "details": {
         "type": "stacks_serialized_transaction",
         "chain": "stacks_mainnet",
-        "serialized_transaction": "0x...",  # your unsigned tx hex
+        "serialized_transaction": "0x...",  # unsigned tx hex
         "push_mode": "auto",
         "fail_on_prediction_failure": False,
     }
 }
 ```
 
-Fordefi fills in the 65-byte signature field and broadcasts the completed transaction.
+Fordefi fills in the 65-byte signature field and broadcasts.
 
 ---
 
@@ -254,6 +251,6 @@ Fordefi fills in the 65-byte signature field and broadcasts the completed transa
 - [SIP-005: Stacks Transaction Wire Format](https://github.com/stacksgov/sips/blob/main/sips/sip-005/sip-005-blocks-and-transactions.md)
 - [Fordefi Stacks Raw Transactions](https://docs.fordefi.com/reference/stacks-raw-transactions)
 - [Fordefi API Authentication](https://docs.fordefi.com/developers/authentication)
-- [Hiro Stacks API — Accounts (nonce)](https://docs.hiro.so/stacks/api/accounts/get-account-info)
-- [Hiro Stacks API — Fee Estimation](https://docs.hiro.so/stacks/api/fees/get-approximate-fees)
+- [Hiro Stacks API - Accounts (nonce)](https://docs.hiro.so/stacks/api/accounts/get-account-info)
+- [Hiro Stacks API - Fee Estimation](https://docs.hiro.so/stacks/api/fees/get-approximate-fees)
 - [Clarity Value Serialization](https://github.com/stacksgov/sips/blob/main/sips/sip-005/sip-005-blocks-and-transactions.md#clarity-value-serialization)
