@@ -7,7 +7,6 @@ Requires .env:
     FORDEFI_API_TOKEN
     FORDEFI_PRIVATE_KEY_PATH
     FORDEFI_VAULT_ID
-    STACKS_NETWORK          (mainnet | testnet)
     STACKS_VAULT_ADDRESS    (STX address of the Fordefi vault)
 
 Usage: edit CONTRACT_ADDRESS, CONTRACT_NAME, FUNCTION_NAME, and ARGS below.
@@ -27,11 +26,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_TOKEN        = os.environ["FORDEFI_API_TOKEN"]
-PRIVATE_KEY_PATH = os.environ["FORDEFI_PRIVATE_KEY_PATH"]
-VAULT_ID         = os.environ["FORDEFI_VAULT_ID"]
-NETWORK          = os.getenv("STACKS_NETWORK", "mainnet")
-VAULT_ADDRESS    = os.environ["STACKS_VAULT_ADDRESS"]
+API_TOKEN     = os.environ["FORDEFI_API_TOKEN"]
+VAULT_ID      = os.environ["FORDEFI_VAULT_ID"]
+VAULT_ADDRESS = os.environ["STACKS_VAULT_ADDRESS"]
+NETWORK       = os.getenv("STACKS_NETWORK", "mainnet")
+
+_SIGNING_KEY = serialization.load_pem_private_key(
+    Path(os.environ["FORDEFI_PRIVATE_KEY_PATH"]).read_bytes(), password=None
+)
 
 HIRO_API = (
     "https://api.mainnet.hiro.so" if NETWORK == "mainnet"
@@ -238,7 +240,7 @@ def _serialize_call_payload_only(
     return p.hex()
 
 
-def estimate_fee(nonce: int, private_key) -> int:
+def estimate_fee(nonce: int) -> int:
     """
     Primary: call Fordefi's predict endpoint with a zero-fee draft transaction.
     The fee field doesn't affect simulation logic — only miner selection — so
@@ -269,7 +271,7 @@ def estimate_fee(nonce: int, private_key) -> int:
     }
     path = "/api/v1/transactions/predict"
     body = json.dumps(predict_payload, separators=(",", ":"))
-    headers = _sign_fordefi_request(private_key, path, body)
+    headers = _sign_fordefi_request(path, body)
     try:
         resp = requests.post(f"https://api.fordefi.com{path}", data=body, headers=headers, timeout=20)
         if resp.ok:
@@ -297,10 +299,10 @@ def estimate_fee(nonce: int, private_key) -> int:
 # Fordefi request signing
 # ---------------------------------------------------------------------------
 
-def _sign_fordefi_request(private_key, path: str, body: str) -> dict:
+def _sign_fordefi_request(path: str, body: str) -> dict:
     timestamp_ms = int(time.time() * 1000)
     message = f"{path}|{timestamp_ms}|{body}".encode()
-    sig = base64.b64encode(private_key.sign(message, ec.ECDSA(hashes.SHA256()))).decode()
+    sig = base64.b64encode(_SIGNING_KEY.sign(message, ec.ECDSA(hashes.SHA256()))).decode()
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_TOKEN}",
@@ -316,16 +318,12 @@ def _sign_fordefi_request(private_key, path: str, body: str) -> dict:
 def main():
     print(f"Calling {CONTRACT_ADDRESS}.{CONTRACT_NAME}::{FUNCTION_NAME}")
 
-    private_key = serialization.load_pem_private_key(
-        Path(PRIVATE_KEY_PATH).read_bytes(), password=None
-    )
-
     # 1. Nonce
     nonce = get_nonce(VAULT_ADDRESS)
     print(f"  Nonce: {nonce}")
 
     # 2. Fee — tries Fordefi predict first, falls back to Hiro
-    fee = estimate_fee(nonce, private_key)
+    fee = estimate_fee(nonce)
     print(f"  Fee: {fee} µSTX")
 
     # 3. Serialize final unsigned tx with real fee
@@ -359,7 +357,7 @@ def main():
     # 5. Sign and submit
     path = "/api/v1/transactions"
     body = json.dumps(payload, separators=(",", ":"))
-    headers = _sign_fordefi_request(private_key, path, body)
+    headers = _sign_fordefi_request(path, body)
 
     print("Submitting to Fordefi...")
     resp = requests.post(f"https://api.fordefi.com{path}", data=body, headers=headers)
